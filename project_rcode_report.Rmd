@@ -1,0 +1,1797 @@
+---
+title: "project_rcode_final"
+author: "Stuart Siu"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    fig_width: 9
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+
+```{r load}
+library(dplyr)
+library(tidyr)
+wsbc_data <- read.csv("wsbc_clean_data_culevel.csv", check.names = F)
+wsbc_data$CU <- as.factor(wsbc_data$CU)
+wsbc_data$Subsector <- as.factor(wsbc_data$Subsector)
+wsbc_data$Sector <- as.factor(wsbc_data$Sector)
+
+wsbc_data <- wsbc_data %>% rename(claim_cost_oy = "claim_costs_paid_(other_years)",
+                                  claim_cost_iy = "claim_costs_paid_(year_of_injury)",
+                                  rtw_lt4 = "rtw_(&lt;=_4_weeks)",
+                                  rtw_lt26 = "rtw_(&lt;=_26_weeks)",
+                                  rtw_gt26 = "rtw_(26_+weeks)",
+                                  premium = "assessments_amount")
+```
+
+Facts: <br> 
+claim cost = NA when CU never first exists <br> 
+payroll = 0 always have claim_cost_iy = 0, not the way though.  <br> 
+753099 - Public Administration Combined CUs has no claim_cost_iy but positive claim_cost_oy <br> 
+Only Subsector = 7020 - Fishing has person_years = NA <br> 
+Only the following CUs have no payrolls -> person_years (One-to-one) <br> 
+Only 722099 - Heavy Construction Combined CUs has no person_years but $10k payroll in 2016, 2017 <br> 
+
+\pagebreak
+
+### Subsector Modeling (Phase 1)
+
+Subsector Model using Subsector aggregated data:
+
+```{r}
+wsbc_data_sublvl <- wsbc_data %>%
+  group_by(Subsector, Sector, Year, Year_index) %>%
+  summarise(
+    across(where(is.numeric), ~ sum(.x, na.rm = TRUE)),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    # Use last year exposures for prior year claims
+    payroll_Lag1 = lag(payroll, n = 1, default = NA),
+    payroll_Lag2 = lag(payroll, n = 2, default = NA),
+    payroll_Lag3 = lag(payroll, n = 3, default = NA),
+    payroll_Lag4 = lag(payroll, n = 4, default = NA),
+    avg_wage = payroll / (person_years + 1),
+    avg_days_lost = total_work_days_lost / (time_loss_claims + 1)
+  ) %>%
+  ungroup()
+```
+
+## First Plots
+
+```{r plot1}
+library(ggplot2)
+library(scales) 
+
+ggplot(wsbc_data_sublvl, aes(x = Year, y = (claim_cost / payroll) * 100, color = Sector)) +
+  geom_smooth(aes(group = Sector, fill = Sector), method = "loess", se = TRUE, alpha = 0.2, linewidth = 1.2) +
+  scale_y_continuous(labels = percent_format(scale = 2)) + 
+  scale_x_continuous(breaks = seq(2015, 2024, by = 2)) +
+  labs(
+    title = "Pure Premium Rates: Sector Averages vs. Subsector Variance",
+    subtitle = "Shaded bands represent the variance of subsectors within their parent sector",
+    x = "Calendar Year",
+    y = "Pure Premium Rate (% of payroll)",
+    color = "Sector",
+    fill = "Sector"
+  ) +
+  theme_minimal()
+
+```
+
+```{r plot2}
+ggplot(wsbc_data_sublvl, aes(x = Year, y = (claim_cost_iy / payroll) * 100, color = Sector)) +
+  geom_smooth(aes(group = Sector, fill = Sector), method = "loess", se = TRUE, alpha = 0.2, linewidth = 1.2) +
+  scale_y_continuous(labels = percent_format(scale = 2)) + 
+  scale_x_continuous(breaks = seq(2015, 2024, by = 2)) +
+  labs(
+    title = "Pure Premium (Injury Year): Sector Averages vs. Subsector Variance",
+    subtitle = "Shaded bands represent the variance of subsectors within their parent sector",
+    x = "Calendar Year",
+    y = "Pure Premium Rate (% of payroll)",
+    color = "Sector",
+    fill = "Sector"
+  ) +
+  theme_minimal()
+```
+
+```{r plot3}
+ggplot(wsbc_data_sublvl, aes(x = Year, y = (claim_cost_oy / payroll) * 100, color = Sector)) +
+  geom_smooth(aes(group = Sector, fill = Sector), method = "loess", se = TRUE, alpha = 0.2, linewidth = 1.2) +
+  scale_y_continuous(labels = percent_format(scale = 2)) + 
+  scale_x_continuous(breaks = seq(2015, 2024, by = 2)) +
+  labs(
+    title = "Pure Premium (Prior Years): Sector Averages vs. Subsector Variance",
+    subtitle = "Shaded bands represent the variance of subsectors within their parent sector",
+    x = "Calendar Year",
+    y = "Pure Premium Rate (% of payroll)",
+    color = "Sector",
+    fill = "Sector"
+  ) +
+  theme_minimal()
+```
+
+Unified vs. Bifurcated Approach <br> 
+Historically, it has been challenging to align current and prior claim costs with the correct exposure base. In this section, we test two distinct architectures: <br> 
+
+The Single Model: A traditional approach attempting to predict total claim costs using the current year's payroll. <br> 
+
+The Bifurcated Model: Splitting the risk into two distinct streams: Injury Year Risk (immediate front-end costs) and Runoff Risk (prior year development). <br> 
+
+By isolating these timelines, we hypothesize that applying a lagged payroll exposure to the Runoff Risk will significantly reduce prediction error. 
+
+\pagebreak
+
+## Phase 1 Modeling
+
+```{r}
+# 8:2 Train/Test Split
+train_data_sublvl <- wsbc_data_sublvl %>% filter(Year <= 2022)
+test_data_sublvl  <- wsbc_data_sublvl %>% filter(Year >= 2023)
+```
+
+### Single Model
+
+Fixed Model: 
+```{r glm subsec, include=FALSE}
+# GLMM with Full Calendar Year Claims
+# Includes random intercept and random slope for subsector-specific inflation trends
+glm_subsec <- glm(
+  claim_cost ~   offset(log(payroll)) + Year_index + Subsector, 
+  data = train_data_sublvl, 
+  family = Gamma(link = "log"),
+)
+```
+
+Mixed Model: 
+```{r glmm subsec}
+# GLMM with Full Calendar Year Claims
+library(lme4)
+# Includes random intercept and random slope for subsector-specific inflation trends
+glmm_subsec <- glmer(
+  claim_cost ~   offset(log(payroll)) + Year_index + (1 + Year_index | Subsector), 
+  data = train_data_sublvl, 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+```
+
+We got AIC: 6322.5 in Fixed Model, and AIC: 6262.4 in Mixed Model that has more degree of freedom on residuals. 
+
+### Split Models
+
+Current year First Paid Claims <br>
+ <br> 
+Fixed Model: 
+```{r glm new, include=FALSE}
+glm_iy <- glm(
+  claim_cost_iy ~   offset(log(payroll)) + Year_index + Subsector, 
+  data = train_data_sublvl, 
+  family = Gamma(link = "log")
+)
+```
+
+Mixed Model: 
+```{r glmm new}
+# GLMM for New Claims (Injury Year Risk)
+# Includes random intercept and random slope for subsector-specific inflation trends
+glmm_iy <- glmer(
+  claim_cost_iy ~   offset(log(payroll)) + Year_index + (1 + Year_index | Subsector), 
+  data = train_data_sublvl, 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+```
+
+We got AIC: 5895 in Fixed Model and AIC: 5893.6 in Mixed Model. 
+
+\pagebreak
+
+### Prior Claim Models
+
+0) Current-Year payroll
+```{r Lag0}
+# GLMM for Prior Claim Development (Control)
+# Uses current year payroll as the exposure base
+glmm_oy_lag0 <- glmer(
+  claim_cost_oy ~   offset(log(payroll)) + Year_index + (1 + Year_index | Subsector),
+  data = train_data_sublvl, 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+```
+
+current year payroll as the exposure base does not align prior years' claims, 
+instead we should match with mix of prior year's payrolls.  
+ <br>  <br> 
+1a) 1-Year Lag payroll (Fixed Model)
+```{r glm Lag1}
+glm_oy_lag1 <- glm(
+  claim_cost_oy ~ offset(log(payroll_Lag1)) + Year_index + Subsector,
+  data = train_data_sublvl %>% filter(Year >= 2016),
+family = Gamma(link = "log"),
+)
+```
+
+AIC: 5448.7, Year_index = 0.006559 with p-value 0.243. 
+ <br>  <br> 
+1b) 1-Year Lag payroll (Mixed Model)
+```{r Lag1}
+# GLMM for Prior Claim Development (Runoff Risk)
+# Uses last year payroll as the exposure base
+glmm_oy_lag1 <- glmer(
+  claim_cost_oy ~   offset(log(payroll_Lag1)) + Year_index + (1 + Year_index | Subsector),
+  # Hold out 2015 since we don't have 2014 payroll
+  data = train_data_sublvl %>% filter(Year >= 2016), 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+```
+
+AIC: 5418.4, Year_index = 0.005299 with group variance 0.003276, Var(RES) = 0.0322
+ <br> 
+1c) 2-Year Lag payroll (Mixed Model)
+```{r Lag2}
+glmm_oy_lag2 <- glmer(
+  claim_cost_oy ~   offset(log(payroll_Lag2)) + Year_index + (1 + Year_index | Subsector),
+  data = train_data_sublvl %>% filter(Year >= 2017), 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+```
+
+AIC: 4670.6, Year_index = 0.02396 with group variance 0.004379, Var(RES) = 0.0352. 
+AIC reduces as observations reduce, not a fair comparison, we should compare with RMSPE.  
+
+\pagebreak
+
+### Validation Step
+
+Testing the Lag Hypothesis <br> 
+To mathematically prove the optimal exposure base for long-tail runoff, we instituted an 8:2 train/test split. The models were trained on data up to 2022, and their predictive accuracy (RMSPE) was evaluated against the unseen 2023-2024 testing data. 
+
+```{r predict}
+# Generate Predictions on the Test Set (Link scale + Offset)
+# Note: type = "response" inverse the offset automatically
+test_data_sublvl$Pred_Full_Costs_Fixed <- predict(glm_subsec, newdata = test_data_sublvl, type = "response")
+test_data_sublvl$Pred_Full_Costs <- predict(glmm_subsec, newdata = test_data_sublvl, type = "response")
+
+test_data_sublvl$Pred_IY_Costs_Fixed <- predict(glm_iy, newdata = test_data_sublvl, type = "response")
+test_data_sublvl$Pred_OY1_Costs_Fixed <- predict(glm_oy_lag1, newdata = test_data_sublvl, type = "response")
+
+test_data_sublvl$Pred_IY_Costs <- predict(glmm_iy, newdata = test_data_sublvl, type = "response")
+test_data_sublvl$Pred_OY0_Costs <- predict(glmm_oy_lag0, newdata = test_data_sublvl, type = "response")
+test_data_sublvl$Pred_OY1_Costs <- predict(glmm_oy_lag1, newdata = test_data_sublvl, type = "response")
+test_data_sublvl$Pred_OY2_Costs <- predict(glmm_oy_lag2, newdata = test_data_sublvl, type = "response")
+
+# Combine for Total Projected Cash Flow
+test_data_sublvl <- test_data_sublvl %>%
+  mutate(
+    Combined_Pred1_Costs_Fixed = Pred_IY_Costs_Fixed + Pred_OY1_Costs_Fixed,
+    Combined_Pred0_Costs = Pred_IY_Costs + Pred_OY0_Costs,
+    Combined_Pred1_Costs = Pred_IY_Costs + Pred_OY1_Costs,
+    Combined_Pred2_Costs = Pred_IY_Costs + Pred_OY2_Costs
+  )
+
+# Calculate Final RMSPE
+rmspe_one_model_fixed <- sqrt(mean((test_data_sublvl$claim_cost - test_data_sublvl$Pred_Full_Costs_Fixed)^2))
+rmspe_one_model <- sqrt(mean((test_data_sublvl$claim_cost - test_data_sublvl$Pred_Full_Costs)^2))
+rmspe_split_model1_fixed <- sqrt(mean((test_data_sublvl$claim_cost - test_data_sublvl$Combined_Pred1_Costs_Fixed)^2))
+rmspe_split_model0 <- sqrt(mean((test_data_sublvl$claim_cost - test_data_sublvl$Combined_Pred0_Costs)^2))
+rmspe_split_model1 <- sqrt(mean((test_data_sublvl$claim_cost - test_data_sublvl$Combined_Pred1_Costs)^2))
+rmspe_split_model2 <- sqrt(mean((test_data_sublvl$claim_cost - test_data_sublvl$Combined_Pred2_Costs)^2))
+
+print(paste("RMSPE of Single Fixed Model: $", formatC(rmspe_one_model_fixed, format="f", digits=2, big.mark=",")))
+print(paste("RMSPE of Single Mixed Model: $", formatC(rmspe_one_model, format="f", digits=2, big.mark=",")))
+print(paste("RMSPE of Bifurcated Fixed Model of 1 Year Prior: $", formatC(rmspe_split_model1_fixed, format="f", digits=2, big.mark=",")))
+print(paste("RMSPE of Bifurcated Mixed Model of 0 Years Prior: $", formatC(rmspe_split_model0, format="f", digits=2, big.mark=",")))
+print(paste("RMSPE of Bifurcated Mixed Model of 1 Year Prior: $", formatC(rmspe_split_model1, format="f", digits=2, big.mark=",")))
+print(paste("RMSPE of Bifurcated Mixed Model of 2 Years Prior: $", formatC(rmspe_split_model2, format="f", digits=2, big.mark=",")))
+```
+
+The bifurcated Lag 1 architecture outperformed the Lag 0 approach, reducing the overall prediction error by nearly $1.2 million. <br> 
+We further utilized a grid search algorithm to test various weighted moving averages of historical payroll (Lags 1 through 4) to see if deeper historical smoothing outperformed a simple 1-year lag. 
+
+### To get the optimized weights 
+(# Weights <= 4 for 8:2 split)
+
+```{r Weights}
+# Define the Grid of Weights
+weight_grid <- expand.grid(
+  w0 = seq(0.0, 1, by = 0.1),
+  w1 = seq(0.0, 1, by = 0.1),
+  w2 = seq(0.0, 1, by = 0.1)) %>%
+  mutate(w3 = 1 - w0 - w1 - w2) %>%
+  filter(w3 > -1e-05)  # Will not be strict 0
+rmspe_results <- numeric(nrow(weight_grid))
+
+# Run the Grid Search Loop
+for (i in 1:nrow(weight_grid)) {
+  # Extract current weights
+  current_w0 <- weight_grid$w0[i]
+  current_w1 <- weight_grid$w1[i]
+  current_w2 <- weight_grid$w2[i]
+  current_w3 <- weight_grid$w3[i] 
+  if (current_w3 > 0) {
+    min_year <- 2018
+  } else if (current_w2 > 0) {
+    min_year <- 2017
+  } else if (current_w1 > 0) {
+    min_year <- 2016
+  } else {
+    min_year <- 2015
+  }
+
+  temp_train <- train_data_sublvl %>%
+    filter(Year >= min_year) %>%  # Make sure to offset the Year = 2015 + Num of Weights
+    mutate(payroll_WA = (current_w0 * coalesce(payroll,0) + 
+                             current_w1 * coalesce(payroll_Lag1,0) + 
+                             current_w2 * coalesce(payroll_Lag2,0) + 
+                             current_w3 * coalesce(payroll_Lag3,0)))
+  
+  temp_test <- test_data_sublvl %>%
+    mutate(payroll_WA = (current_w0 * coalesce(payroll,0) + 
+                             current_w1 * coalesce(payroll_Lag1,0) + 
+                             current_w2 * coalesce(payroll_Lag2,0) + 
+                             current_w3 * coalesce(payroll_Lag3,0)))
+  # tryCatch prevents errors from stopping the loop
+  fit_iy <- tryCatch({
+    glmer(
+      claim_cost_iy ~ offset(log(payroll_WA)) + Year_index + (1 + Year_index | Subsector),
+      data = temp_train,
+      family = Gamma(link = "log"),
+      control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+    )
+  }, error = function(e) return(NULL))
+  # If the model converges successfully, calculate the RMSPE
+  if (!is.null(fit_iy)) {
+    preds <- predict(fit_iy, newdata = temp_test, type = "response")
+    sq_error <- (temp_test$claim_cost_iy - preds)^2
+    rmspe_results[i] <- sqrt(mean(sq_error))
+  } else {
+    rmspe_results[i] <- NA # Flag models that failed to converge
+  }
+}
+
+# Compile and View the Winning Profiles
+weight_grid$RMSPE_iy <- rmspe_results
+best_weights_iy <- weight_grid %>% arrange(RMSPE_iy) %>% head(5)
+print(best_weights_iy)
+```
+
+```{r}
+curve_data <- weight_grid %>%
+  arrange(RMSPE_iy) %>% 
+  head(20) %>%
+  arrange(w0)
+
+ggplot(curve_data, aes(x = w0, y = RMSPE_iy)) +
+  geom_smooth(color = "#2c3e50", linewidth = 1.2, method="loess", se = FALSE) +
+  geom_point(color = "#e67e22", size = 3) +
+  scale_x_continuous(labels = scales::percent_format(), breaks = seq(0, 1, 0.1)) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Exposure Alignment: Optimizing Injury-Year Prediction Error",
+    subtitle = "Shifting exposure weight from Other Years to Current Year",
+    x = "Weight Assigned to Current Payroll",
+    y = "Injury Year RMSPE ($)"
+  ) +
+  theme_minimal(base_size = 14) +
+  # Highlight your selected model
+  annotate("point", x = 1.0, y = 2983596, color = "red", size = 4) +
+  annotate("text", x = 0.9, y = 3000000, label = "Selected Baseline\n(100% Current)", color = "red", hjust = 1)
+```
+
+Yes, lag1 is overfitting on test years... To be honest, we couldn't figure out a better way to adjust this but don't forget here we aim to detrend and we are running out of degree of freedom (Otherwise we could put all available lags as offsets!). 
+At least from below we found lag1 generalize most of the claim costs from past decade therefore it is better suit on the runoff costs. 
+Now we do the same with OY, 
+
+```{r}
+# Run the Grid Search Loop
+for (i in 1:nrow(weight_grid)) {
+  # Extract current weights
+  current_w0 <- weight_grid$w0[i]
+  current_w1 <- weight_grid$w1[i]
+  current_w2 <- weight_grid$w2[i]
+  current_w3 <- weight_grid$w3[i] 
+  if (current_w3 > 0) {
+    min_year <- 2018
+  } else if (current_w2 > 0) {
+    min_year <- 2017
+  } else if (current_w1 > 0) {
+    min_year <- 2016
+  } else {
+    min_year <- 2015
+  }
+  # Apply weights to create the exposure proxy (Scaled to Millions)
+  temp_train <- train_data_sublvl %>%
+    filter(Year >= min_year) %>%  # Make sure to offset the Year = 2015 + # Weights
+    mutate(payroll_WA = (current_w0 * coalesce(payroll,0) + 
+                             current_w1 * coalesce(payroll_Lag1,0) + 
+                             current_w2 * coalesce(payroll_Lag2,0) + 
+                             current_w3 * coalesce(payroll_Lag3,0)))
+  
+  temp_test <- test_data_sublvl %>%
+    mutate(payroll_WA = (current_w0 * coalesce(payroll,0) + 
+                             current_w1 * coalesce(payroll_Lag1,0) + 
+                             current_w2 * coalesce(payroll_Lag2,0) + 
+                             current_w3 * coalesce(payroll_Lag3,0)))
+  # tryCatch prevents errors from stopping the loop
+  fit_oy <- tryCatch({
+    glmer(
+      claim_cost_oy ~ offset(log(payroll_WA)) + Year_index + (1 + Year_index | Subsector),
+      data = temp_train,
+      family = Gamma(link = "log"),
+      control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+    )
+  }, error = function(e) return(NULL))
+  # If the model converges successfully, calculate the RMSPE
+  if (!is.null(fit_oy)) {
+    preds <- predict(fit_oy, newdata = temp_test, type = "response")
+    sq_error <- (temp_test$claim_cost_oy - preds)^2
+    rmspe_results[i] <- sqrt(mean(sq_error))
+  } else {
+    rmspe_results[i] <- NA # Flag models that failed to converge
+  }
+}
+
+# Compile and View the Winning Profiles
+weight_grid$RMSPE_oy <- rmspe_results
+best_weights_oy <- weight_grid %>% arrange(RMSPE_oy) %>% head(5)
+print(best_weights_oy)
+```
+
+```{r}
+curve_data <- weight_grid %>%
+  arrange(RMSPE_oy) %>% 
+  head(20) %>%
+  arrange(w1)
+
+ggplot(curve_data, aes(x = w1, y = RMSPE_oy)) +
+  geom_smooth(color = "#2c3e50", linewidth = 1.2, method="loess", se = FALSE) +
+  geom_point(color = "#e67e22", size = 3) +
+  scale_x_continuous(labels = scales::percent_format(), breaks = seq(0, 1, 0.1)) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Exposure Alignment: Optimizing Prior-Year Prediction Error",
+    subtitle = "Shifting exposure weight from Other Years to 1-Year Lag",
+    x = "Weight Assigned to 1-Year Lag Payroll",
+    y = "Prior Year RMSPE ($)"
+  ) +
+  theme_minimal(base_size = 14) + 
+  annotate("point", x = 1.0, y = 5403901, color = "red", size = 4) +
+  annotate("text", x = 0.98, y = 5600000, label = "Selected Baseline\n(100% Lag1)", color = "red", hjust = 1)
+```
+
+Post-report: This could be a less bias way to run the weight grid, 3:1 to 6:1 validation test. This suggests a 50:50 on lag1 and current on prior costs. Note that the proportion would be different if we drop w3 and extend the testing window by one more year, that's why we don't want to put too much faith on such results, knowing the alignment on lag1 is enough. 
+
+```{r}
+# Everyone starts at 2018 so w3 is possible
+wsbc_data_sublvl_model <- wsbc_data_sublvl %>% filter(Year >= 2018)
+
+# The last 4 available years
+test_years <- c(2021, 2022, 2023, 2024)
+
+rmspe_results <- numeric(nrow(weight_grid))
+
+# Grid Search for IY
+for (i in 1:nrow(weight_grid)) {
+  current_w0 <- weight_grid$w0[i]
+  current_w1 <- weight_grid$w1[i]
+  current_w2 <- weight_grid$w2[i]
+  current_w3 <- weight_grid$w3[i] 
+
+    temp_data <- wsbc_data_sublvl_model %>%
+    mutate(payroll_WA = (current_w0 * coalesce(payroll,0) + 
+                         current_w1 * coalesce(payroll_Lag1,0) + 
+                         current_w2 * coalesce(payroll_Lag2,0) + 
+                         current_w3 * coalesce(payroll_Lag3,0)))
+  
+  fold_sq_errors <- c()
+  
+  model_failed <- FALSE
+  for (t_year in test_years) {
+    
+    train_fold <- temp_data %>% filter(Year < t_year)
+    test_fold  <- temp_data %>% filter(Year == t_year)
+    
+    fit_iy <- tryCatch({
+      glmer(
+        claim_cost_iy ~ offset(log(payroll_WA)) + Year_index + (1 + Year_index | Subsector),
+        data = train_fold,
+        family = Gamma(link = "log"),
+        control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+      )
+    }, error = function(e) return(NULL))
+    
+    if (!is.null(fit_iy)) {
+      preds <- predict(fit_iy, newdata = test_fold, type = "response")
+      sq_error <- (test_fold$claim_cost_iy - preds)^2
+      fold_sq_errors <- c(fold_sq_errors, sq_error)
+    } else {
+      model_failed <- TRUE
+      break # If it fails on one fold, scrap this weight combination
+    }
+  }
+  
+  if (!model_failed && length(fold_sq_errors) > 0) {
+    rmspe_results[i] <- sqrt(mean(fold_sq_errors))
+  } else {
+    rmspe_results[i] <- NA 
+  }
+}
+
+weight_grid$RMSPE_iy <- rmspe_results
+
+# Grid Search for OY
+for (i in 1:nrow(weight_grid)) {
+  current_w0 <- weight_grid$w0[i]
+  current_w1 <- weight_grid$w1[i]
+  current_w2 <- weight_grid$w2[i]
+  current_w3 <- weight_grid$w3[i] 
+
+    temp_data <- wsbc_data_sublvl_model %>%
+    mutate(payroll_WA = (current_w0 * coalesce(payroll,0) + 
+                         current_w1 * coalesce(payroll_Lag1,0) + 
+                         current_w2 * coalesce(payroll_Lag2,0) + 
+                         current_w3 * coalesce(payroll_Lag3,0)))
+  
+  fold_sq_errors <- c()
+  
+  model_failed <- FALSE
+  for (t_year in test_years) {
+    
+    train_fold <- temp_data %>% filter(Year < t_year)
+    test_fold  <- temp_data %>% filter(Year == t_year)
+    
+    fit_oy <- tryCatch({
+      glmer(
+        claim_cost_oy ~ offset(log(payroll_WA)) + Year_index + (1 + Year_index | Subsector),
+        data = train_fold,
+        family = Gamma(link = "log"),
+        control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+      )
+    }, error = function(e) return(NULL))
+    
+    if (!is.null(fit_oy)) {
+      preds <- predict(fit_oy, newdata = test_fold, type = "response")
+      sq_error <- (test_fold$claim_cost_oy - preds)^2
+      fold_sq_errors <- c(fold_sq_errors, sq_error)
+    } else {
+      model_failed <- TRUE
+      break # If it fails on one fold, scrap this weight combination
+    }
+  }
+  
+  if (!model_failed && length(fold_sq_errors) > 0) {
+    rmspe_results[i] <- sqrt(mean(fold_sq_errors))
+  } else {
+    rmspe_results[i] <- NA 
+  }
+}
+
+weight_grid$RMSPE_oy <- rmspe_results
+```
+
+```{r}
+curve_data_iy <- weight_grid %>%
+  arrange(RMSPE_iy) %>% 
+  head(20) %>%
+  pivot_longer(
+    cols = c(w0, w1, w2, w3),
+    names_to = "Weight_Name",
+    values_to = "Weight_Value"
+  ) %>%
+  mutate(Weight_Name = case_when(
+    Weight_Name == "w0" ~ "Current Year (w0)",
+    Weight_Name == "w1" ~ "1-Year Lag (w1)",
+    Weight_Name == "w2" ~ "2-Year Lag (w2)",
+    Weight_Name == "w3" ~ "3-Year Lag (w3)"
+  ))
+
+ggplot(curve_data_iy, aes(x = Weight_Value, y = RMSPE_oy, color = Weight_Name)) +
+  geom_point(size = 3, alpha = 0.7) +
+  scale_x_continuous(labels = scales::percent_format(), breaks = seq(0, 1, 0.1)) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  scale_color_viridis_d(option = "viridis") + 
+  labs(
+    title = "Exposure Alignment: Optimizing Injury-Year Prediction Error",
+    subtitle = "Comparing the impact of all exposure lags on RMSPE",
+    x = "Assigned Weight",
+    y = "Injury Year RMSPE ($)",
+    color = "Weight Lag"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+curve_data_oy <- weight_grid %>%
+  arrange(RMSPE_oy) %>% 
+  head(20) %>%
+  pivot_longer(
+    cols = c(w0, w1, w2, w3),
+    names_to = "Weight_Name",
+    values_to = "Weight_Value"
+  ) %>%
+  mutate(Weight_Name = case_when(
+    Weight_Name == "w0" ~ "Current Year (w0)",
+    Weight_Name == "w1" ~ "1-Year Lag (w1)",
+    Weight_Name == "w2" ~ "2-Year Lag (w2)",
+    Weight_Name == "w3" ~ "3-Year Lag (w3)"
+  ))
+
+ggplot(curve_data_oy, aes(x = Weight_Value, y = RMSPE_oy, color = Weight_Name)) +
+  geom_point(size = 3, alpha = 0.7) +
+  scale_x_continuous(labels = scales::percent_format(), breaks = seq(0, 1, 0.1)) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  scale_color_viridis_d(option = "viridis") + 
+  labs(
+    title = "Exposure Alignment: Optimizing Prior-Year Prediction Error",
+    subtitle = "Comparing the impact of all exposure lags on RMSPE",
+    x = "Assigned Weight",
+    y = "Prior Year RMSPE ($)",
+    color = "Weight Lag"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+The optimization confirmed that placing high weight on the 1-year lagged payroll minimizes the Root Mean Square Prediction Error (RMSPE), you see some lag0 signals could be more favorable, but for simplicity we put 100% on 1-year lag. 
+Also deeper historical lags or complex moving averages did not improve accuracy, indicating that the immediate past-year workforce volume is the single strongest predictor of near-term runoff cash flow.
+ <br> 
+Weighted Exposures Linearity: 
+```{r loglog}
+# Exposure Alignment: Log-Log Linearity Comparison
+library(tidyr)
+# Filter years where we have all lags available
+plot_data <- wsbc_data_sublvl %>%
+  select(Subsector, Year, claim_cost_iy, claim_cost_oy, payroll, payroll_Lag1, payroll_Lag2, payroll_Lag3, payroll_Lag4) %>%
+  mutate(
+    log_CY_IY = log(claim_cost_iy),
+    log_CY_OY = log(claim_cost_oy),
+    "0-Lag (Current)" = log(payroll),
+    "1-Year Lag" = log(payroll_Lag1),
+    "2-Year WA" = log(0.0*payroll_Lag1 + 1.0*payroll_Lag2),
+    "3-Year WA" = log(0.0*payroll_Lag1 + 0.6*payroll_Lag2 + 0.4*payroll_Lag3),
+    "4-Year WA" = log(0.0*payroll_Lag1 + 0.2*payroll_Lag2 + 0.0*payroll_Lag3 + 0.8*payroll_Lag4)
+  ) %>%
+  pivot_longer(
+    cols = c("0-Lag (Current)", "1-Year Lag", "2-Year WA", "3-Year WA", "4-Year WA"),
+    names_to = "Exposure_Base",
+    values_to = "log_Exposure"
+  )
+
+ggplot(plot_data, aes(x = log(payroll), y = log(claim_cost_iy))) +
+  geom_point(alpha = 0.15, color = "darkgrey") + 
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) + 
+  geom_abline(slope = 1, intercept = -5.5, linetype = "dashed", color = "black", linewidth = 1.2) + 
+  labs(
+    title = "Exposure Alignment: Linearity",
+    subtitle = "Comparing empirical fits against the theoretical (Over Last Decade)",
+    x = "Log(payroll Exposure)",
+    y = "Log(Current Year Claim Costs)"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggplot(plot_data, aes(x = log_Exposure, y = log_CY_OY, color = Exposure_Base)) +
+  geom_point(alpha = 0.15) + 
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) + 
+  geom_abline(slope = 1, intercept = -4.3, linetype = "dashed", color = "black", linewidth = 1.2) + 
+  scale_color_brewer(palette = "Set1") + 
+  labs(
+    title = "Exposure Alignment: Linearity Comparison",
+    subtitle = "Comparing empirical fits against the theoretical (Over Last Decade)",
+    x = "Log(payroll Exposure Base)",
+    y = "Log(Prior Year Claim Costs)",
+    color = "Exposure Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  ) + 
+  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+```
+
+The log-log linearity of payroll base vs claims costs holds, but there exists some high exposure subsectors having lower pure premiums. 
+
+\pagebreak
+
+### Financial Validation
+Error Margin & Premium Absorption: 
+```{r Perform}
+# Calculate the Annualized Provincial Error
+# RMSPE is the average error per subsector per year
+# Multiply by the number of subsectors to get the total provincial annual error
+num_subsectors <- n_distinct(test_data_sublvl$Subsector)
+provincial_annual_error <- rmspe_split_model1 * num_subsectors
+
+annual_financials <- test_data_sublvl %>%
+  group_by(Year) %>%
+  summarise(
+    Annual_Claims = sum(claim_cost, na.rm = TRUE),
+    Annual_Premium = sum(premium, na.rm = TRUE)
+  ) %>%
+  summarise(
+    # two year average
+    Avg_Annual_Claims = mean(Annual_Claims),
+    Avg_Annual_Premium = mean(Annual_Premium)
+  )
+
+error_margin_claims <- provincial_annual_error / annual_financials$Avg_Annual_Claims
+premium_absorption_rate <- provincial_annual_error / annual_financials$Avg_Annual_Premium
+
+# Print the final executive summary metrics
+print(paste("Annualized Provincial Error: $", formatC(provincial_annual_error, format="f", digits=2, big.mark=",")))
+print(paste("Average Annual Claim Costs: $", formatC(annual_financials$Avg_Annual_Claims, format="f", digits=2, big.mark=",")))
+print(paste("Average Annual Premium Base: $", formatC(annual_financials$Avg_Annual_Premium, format="f", digits=2, big.mark=",")))
+print(paste("--> Claim Cost Error Margin:", round(error_margin_claims * 100, 2), "%"))
+print(paste("--> Premium Absorption Rate:", round(premium_absorption_rate * 100, 2), "%"))
+```
+
+While the methodology is sound, this 11.83% error margin suggests that significant variances remain hidden within specific industries. To address this, we must transition from Subsector-level models down to granular, CU-level analyses.
+
+\pagebreak
+
+# Full 10-Year Subsector Trends
+Using the current best-of-fit model to analyze risks over a decade
+```{r glmm_10yr}
+glm_10 <- glm(
+  claim_cost ~   offset(log(payroll)) + Year_index + Subsector, 
+  data = wsbc_data_sublvl, 
+  family = Gamma(link = "log")
+)
+
+glmm_10 <- glmer(
+  claim_cost ~   offset(log(payroll)) + Year_index + (1 + Year_index | Subsector), 
+  data = wsbc_data_sublvl, 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+
+glm_iy_10 <- glm(
+  claim_cost_iy ~   offset(log(payroll)) + Year_index + Subsector, 
+  data = wsbc_data_sublvl, 
+  family = Gamma(link = "log")
+)
+
+glmm_iy_10 <- glmer(
+  claim_cost_iy ~   offset(log(payroll)) + Year_index + (1 + Year_index | Subsector), 
+  data = wsbc_data_sublvl, 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+
+glm_oy_10 <- glmer(
+  claim_cost_oy ~   offset(log(payroll)) + Year_index + (1 + Year_index | Subsector),
+  data = wsbc_data_sublvl, 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+
+glmm_oy_10_nolag <- glmer(
+  claim_cost_oy ~   offset(log(payroll)) + Year_index + (1 + Year_index | Subsector),
+  data = wsbc_data_sublvl, 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+
+glmm_oy_10 <- glmer(
+  claim_cost_oy ~   offset(log(payroll_Lag1)) + Year_index + (1 + Year_index | Subsector),
+  data = wsbc_data_sublvl %>% filter(Year >= 2016), 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+
+glmm_oy_10_lag2 <- glmer(
+  claim_cost_oy ~   offset(log(payroll_Lag2)) + Year_index + (1 + Year_index | Subsector),
+  data = wsbc_data_sublvl %>% filter(Year >= 2017), 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+
+```
+
+To compare the models, we do 8 year (2017 - 2024) evaluation. 
+
+```{r}
+eval_8yr_data <- wsbc_data_sublvl %>% filter(Year >= 2017)
+
+# 1
+pred_fixed_10 <- predict(glm_10, newdata = eval_8yr_data, type = "response")
+rmse_one_model_fixed <- sqrt(mean((eval_8yr_data$claim_cost - pred_fixed_10)^2))
+# 2
+pred_mixed_10 <- predict(glmm_10, newdata = eval_8yr_data, type = "response")
+rmse_one_model_mixed <- sqrt(mean((eval_8yr_data$claim_cost - pred_mixed_10)^2))
+# 3
+pred_iy_10_fixed <- predict(glm_iy_10, newdata = eval_8yr_data, type = "response")
+pred_oy_10_fixed <- predict(glm_oy_10, newdata = eval_8yr_data, type = "response")
+combined_pred_10_fixed <- pred_iy_10_fixed + pred_oy_10_fixed
+rmse_split_model1_fixed <- sqrt(mean((eval_8yr_data$claim_cost - combined_pred_10_fixed)^2))
+# 4
+pred_iy_10 <- predict(glmm_iy_10, newdata = eval_8yr_data, type = "response")
+pred_oy_10_nolag <- predict(glmm_oy_10_nolag, newdata = eval_8yr_data, type = "response")
+combined_pred_10_nolag <- pred_iy_10 + pred_oy_10_nolag
+rmse_split_model0 <- sqrt(mean((eval_8yr_data$claim_cost - combined_pred_10_nolag)^2))
+# 5
+pred_oy_10 <- predict(glmm_oy_10, newdata = eval_8yr_data, type = "response")
+combined_pred_10 <- pred_iy_10 + pred_oy_10
+rmse_split_model1 <- sqrt(mean((eval_8yr_data$claim_cost - combined_pred_10)^2))
+# 6
+pred_oy_10_lag2 <- predict(glmm_oy_10_lag2, newdata = eval_8yr_data, type = "response")
+combined_pred_10_lag2 <- pred_iy_10 + pred_oy_10_lag2
+rmse_split_model2 <- sqrt(mean((eval_8yr_data$claim_cost - combined_pred_10_lag2)^2))
+
+model_arch <- c("Single","Single","Bifurcated","Bifurcated","Bifurcated","Bifurcated")
+model_type <- c("Fixed","Mixed","Fixed","Mixed","Mixed","Mixed")
+exp_base <- c("Lag 0","Lag 0","IY: Lag 0 / OY: Lag 1","IY: Lag 0 / OY: Lag 0","IY: Lag 0 / OY: Lag 1","IY: Lag 0 / OY: Lag 2")
+rmspe_82split <- c(rmspe_one_model_fixed,rmspe_one_model,rmspe_split_model1_fixed,rmspe_split_model0,rmspe_split_model1,rmspe_split_model2)
+rmse_8eval <- c(rmse_one_model_fixed,rmse_one_model_mixed,rmse_split_model1_fixed,rmse_split_model0,rmse_split_model1,rmse_split_model2)
+
+library(kableExtra)
+model_compare <- data.frame(model_arch,model_type,exp_base,rmse_8eval,rmspe_82split) %>%
+  mutate(
+    error_margin = percent((rmspe_82split * 24) / annual_financials$Avg_Annual_Claims, accuracy = 0.01),
+    rmse_8eval = dollar(rmse_8eval),
+    rmspe_82split = dollar(rmspe_82split)
+  ) %>%
+  # Rename columns for the final printout
+  rename(
+    `Architecture` = model_arch,
+    `Model Type` = model_type,
+    `Exposure Base` = exp_base,
+    `8-Year Fit (RMSE)` = rmse_8eval,
+    `Test Set (RMSPE)` = rmspe_82split,
+    `Claim Cost Error Margin` = error_margin
+  )
+kable(model_compare, booktabs = TRUE, 
+      caption = "Final Model Evaluation Summary") %>% 
+kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE) %>%
+  row_spec(5, bold = TRUE)
+```
+
+
+
+\pagebreak
+
+## Phase 2 Modeling
+
+```{r}
+# same as glmm_iy above
+glmm_iy_sub <- glmer(
+  claim_cost_iy ~   offset(log(payroll)) + Year_index + (1 + Year_index | Subsector), 
+  data = wsbc_data_sublvl, 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+# same as glmm_oy_lag1 above
+glmm_oy_sub <- glmer(
+  claim_cost_oy ~   offset(log(payroll_Lag1)) + Year_index + (1 + Year_index | Subsector),
+  data = wsbc_data_sublvl %>% filter(Year >= 2016), 
+  family = Gamma(link = "log"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+```
+
+Subsector Model using CU level data: 
+
+```{r glmm IY}
+wsbc_data_culvl <- wsbc_data %>%
+  group_by(Sector, Subsector, CU, Year, Year_index) %>%
+  summarise(
+    # Remove NA claim years (NA if CU never first exists)
+    across(where(is.numeric), ~ sum(.x, na.rm = TRUE)),
+    .groups = 'drop'
+  )
+wsbc_data_culvl <- wsbc_data_culvl %>%
+  arrange(CU, Year) %>%
+  filter(payroll > 10000) %>%
+  mutate(
+    # Use last year exposures for prior year claims
+    payroll_Lag1 = lag(payroll, n = 1, default = NA),
+    avg_wage = payroll / (person_years + 1),
+    avg_days_lost = total_work_days_lost / (time_loss_claims + 1)
+  ) %>%
+  ungroup()
+
+library(glmmTMB)
+
+glmm_iy_cu <- glmmTMB(
+  claim_cost_iy ~ offset(log(payroll)) + Year_index + (1 + Year_index | Subsector) + (1 | CU), 
+  data = wsbc_data_culvl, 
+  family = glmmTMB::tweedie(link = "log"),
+  control = glmmTMBControl(optCtrl = list(iter.max = 1e+3, eval.max = 1e+3))
+)
+glmm_oy_cu <- glmmTMB(
+  claim_cost_oy ~ offset(log(payroll_Lag1)) + Year_index + (1 + Year_index | Subsector) + (1 | CU),
+  data = wsbc_data_culvl %>% filter(Year >= 2016), 
+  family = glmmTMB::tweedie(link = "log"),
+  control = glmmTMBControl(optCtrl = list(iter.max = 1e+3, eval.max = 1e+3))
+)
+```
+
+The full model with CU as random effects is very difficult to interpret. In order to showcase a presentable results, we aim at the outstanding subsectors and target their CUs for further structural risk analysis. 
+
+### Random Effects
+
+```{r arrows}
+# Compile all Random Effects (Unlike ranef, coef includes fixed effects!)
+risk_vectors <- data.frame(
+  Subsector = rownames(coef(glmm_iy_sub)$Subsector),
+  Int_IY = coef(glmm_iy_sub)$Subsector[["(Intercept)"]],
+  Slope_IY = coef(glmm_iy_sub)$Subsector[["Year_index"]],
+  Int_OY = coef(glmm_oy_sub)$Subsector[["(Intercept)"]],
+  Slope_OY = coef(glmm_oy_sub)$Subsector[["Year_index"]]
+)
+
+library(stringr)
+
+# Add Sector names for coloring
+risk_vectors <- risk_vectors %>%
+  left_join(wsbc_data_sublvl %>% select(Subsector, Sector) %>% distinct(), by = "Subsector") %>%
+  mutate(Sector = as.character(Sector)) %>% 
+  mutate(Sector = stringr::str_trunc(Sector, width = 25, side = "right"))
+
+# 3. Calculate the start and end points
+risk_vectors <- risk_vectors %>%
+  mutate(
+    # Base of the arrow (Start at t=5)
+    Start_IY = exp(Int_IY + (Slope_IY * 5)),
+    Start_OY = exp(Int_OY + (Slope_OY * 5)),
+    
+    # Tip of the arrow (Ends at t=9)
+    End_IY = exp(Int_IY + (Slope_IY * 9)),
+    End_OY = exp(Int_OY + (Slope_OY * 9)),
+    
+    # Calculate the total drift (Euclidean distance of the arrow)
+    # Note that x axis has smaller scale!!!
+    Vector_Length = sqrt((End_IY - Start_IY)^2 + (End_OY - Start_OY)^2),
+    Rate_Drift = (End_IY - Start_IY) + (End_OY - Start_OY),
+    # Adjust the threshold up or down to control the label counts
+    Display_Label = case_when(
+      Vector_Length > 1.4e-3 ~ Subsector,
+      TRUE ~ "" # Leave it blank if the distance is too short
+      ),
+    Highlight_Alpha = case_when(
+      Display_Label == "" ~ 0.3, # Make unlabeled arrows 70% transparent
+      TRUE ~ 0.9                 # Keep labeled arrows solid
+    )
+  )
+
+# Plot the Vector Map
+library(ggplot2)
+library(scales) 
+library(ggrepel)
+library(knitr)
+ggplot(risk_vectors, aes(x = Start_IY, y = Start_OY)) +
+  geom_segment(
+    aes(xend = End_IY, yend = End_OY, color = Sector, alpha = Highlight_Alpha),
+    arrow = arrow(length = unit(0.25, "cm"), type = "closed"),
+    linewidth = 1
+  ) +
+  geom_point(aes(color = Sector, alpha = Highlight_Alpha), size = 2.5) +
+  geom_text_repel(
+    aes(x = End_IY, y = End_OY, label = Display_Label),
+    size = 3.5, 
+    box.padding = 0.6, 
+    point.padding = 0.2, 
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  labs(
+    title = "5-Year Risk Trajectory (2020 - 2024)",
+    subtitle = "Arrows indicate the movement in Claim Costs (% of payroll)",
+    x = "New Claims Base Rate (% of payroll)",
+    y = "Prior Claims Tail Rate (% of payroll)",
+    color = "Sector"
+  ) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1), breaks = seq(0, 0.04, by = 0.005)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1), breaks = seq(0, 0.04, by = 0.005)) +
+  scale_alpha_identity() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+
+# Compile and View the Winning Profiles
+sig_vectors <- risk_vectors %>% filter(Vector_Length > 1.4e-3) %>% 
+  select(Subsector,Sector,Int_IY,Slope_IY,Int_OY,Slope_OY,Vector_Length,Rate_Drift) %>% 
+  mutate_if(is.numeric, signif, digits = 2)
+sig_vectors %>% mutate(
+  trend_IY = scales::percent(exp(Slope_IY) - 1, accuracy = 0.1),
+  trend_OY = scales::percent(exp(Slope_OY) - 1, accuracy = 0.1),
+  Vector_Length = scales::percent(abs(Vector_Length), accuracy = 0.01),
+  Rate_Drift = scales::percent(abs(Rate_Drift), accuracy = 0.01),
+  ) %>% 
+  select(Subsector, trend_IY, trend_OY,Vector_Length,Rate_Drift) %>%
+  arrange(desc(Vector_Length))%>%
+  kable(caption = "Top Risk Trajectories by Subsector")
+
+```
+
+\pagebreak
+
+## CU level Modeling
+
+### 1. 7020 - Fishing
+
+```{r fish_select}
+fishing_data <- wsbc_data_culvl %>% 
+  filter(Subsector == "7020 - Fishing") %>%
+  arrange(CU, Year) %>%
+  group_by(CU) %>%
+  mutate(
+    Payroll_Lag1 = lag(payroll, n = 1, default = NA)
+  ) %>%
+  ungroup()
+
+fishing_clean <- fishing_data %>%
+  select(
+    CU, claim_cost_iy, claim_cost_oy, Year_index, payroll, Payroll_Lag1, 
+    time_loss_claims, first_paid_ltd_claims, serious_injury_claims, 
+    six_month_truncated_duration, total_work_days_lost, 
+    rtw_lt4, rtw_lt26, rtw_gt26, sprains_and_strains_claims, long_recovery_sprains_and_strains_claims, 
+    `std/ltd/fatal_claims`, young_worker_claims, mature_worker_claims, 
+    first_paid_msi_claims, `msi_claims_(by_injury_year)`, 
+    first_paid_mvi_claims, `mvi_claims_(by_injury_year)`, 
+    aov_claims, overexertion_claims, fall_on_same_level_claims, 
+    average_completed_duration, total_work_days_lost, employer_cus, 
+    inspection_reports, other_contacts, orders, net_penalties_imposed, warning_letters_sent
+  )
+
+# Feature Engineering
+fishing_iy_trd <- coef(glmm_iy_sub)$Subsector["7020 - Fishing", "Year_index"]
+fishing_oy_trd <- coef(glmm_oy_sub)$Subsector["7020 - Fishing", "Year_index"]
+fishing_iy_int <- coef(glmm_iy_sub)$Subsector["7020 - Fishing", "(Intercept)"]
+fishing_oy_int <- coef(glmm_oy_sub)$Subsector["7020 - Fishing", "(Intercept)"]
+
+fishing_clean <- fishing_clean %>%
+  mutate(
+    logpay_iy_trend = log(payroll) + fishing_iy_int + fishing_iy_trd * Year_index,
+    logpay_oy_trend = log(Payroll_Lag1) + fishing_oy_int + fishing_oy_trd * Year_index,
+    avg_days_lost = total_work_days_lost / (time_loss_claims+ 1),
+    srs_rate = serious_injury_claims / (time_loss_claims+ 1),
+    rtwr_4 = rtw_lt4 / (rtw_lt26 + rtw_gt26+ 1),
+    rtwr_26 = rtw_gt26 / (rtw_lt26 + rtw_gt26+ 1),
+    lrss_rate = long_recovery_sprains_and_strains_claims / (sprains_and_strains_claims+ 1),
+    violate = orders / (inspection_reports+ 1)
+  )
+
+# 1. Base Exposure: offset(log(payroll))
+# 2. Macro Trend: Year_index
+# 3. The Frequency Rep: time_loss_claims
+# 4. The Severity Rep: days_lost
+
+library(stats)
+# Current Year
+fit_iy_full <- glm(
+  claim_cost_iy ~ offset(logpay_iy_trend) + time_loss_claims + 
+    rtwr_4 + srs_rate + I(avg_days_lost/100) + violate,
+  data = fishing_clean,
+  family = Gamma(link = "log")
+)
+# Backward Stepwise algorithm
+fit_iy_final <- step(fit_iy_full, direction = "backward", trace = 0) 
+
+# Prior Year
+fit_oy_full <- glm(
+  claim_cost_oy ~ offset(logpay_oy_trend) + time_loss_claims +  
+    rtwr_26 + srs_rate + I(avg_days_lost/100) + lrss_rate + violate,
+  data = fishing_clean %>% filter(Year_index > 0),
+  family = Gamma(link = "log")
+)
+fit_oy_final <- step(fit_oy_full, direction = "backward", trace = 0)
+
+library(stargazer)
+# Focus on Var. Sig.
+stargazer(fit_iy_final, fit_oy_final,
+          type = "text", 
+          title = "Fishing: Stepwise GLM Selection",
+          column.labels = c("Injury Year (IY)", "Prior Year (OY)"),
+          dep.var.labels = c("Claim Costs"),
+          omit.stat = c("LL", "bic"),
+          single.row = TRUE)
+```
+```{r}
+# Current Year
+fit_iy_full <- glm(
+  claim_cost_iy ~ offset(logpay_iy_trend) + time_loss_claims + 
+    rtwr_4 + srs_rate + I(avg_days_lost/100) + violate + CU,
+  data = fishing_clean,
+  family = Gamma(link = "log")
+)
+# Backward Stepwise algorithm
+fit_iy_final <- step(fit_iy_full, direction = "backward", trace = 0) 
+
+# Prior Year
+fit_oy_full <- glm(
+  claim_cost_oy ~ offset(logpay_oy_trend) + time_loss_claims +  
+    rtwr_26 + srs_rate + I(avg_days_lost/100) + lrss_rate + violate + CU,
+  data = fishing_clean %>% filter(Year_index > 0),
+  family = Gamma(link = "log")
+)
+fit_oy_final <- step(fit_oy_full, direction = "backward", trace = 0)
+
+library(stargazer)
+# Focus on Var. Sig.
+stargazer(fit_iy_final, fit_oy_final,
+          type = "text", 
+          title = "Fishing: Stepwise GLM Selection",
+          column.labels = c("Injury Year (IY)", "Prior Year (OY)"),
+          dep.var.labels = c("Claim Costs"),
+          omit.stat = c("LL", "bic"),
+          single.row = TRUE)
+```
+
+Baseline: CU702001 - Fin Fish Farming <br> 
+ <br> 
+
+How the CU replaced rtwr_4?
+```{r}
+library(forcats)
+
+# Create the plot to compare rtwr_4 across CUs
+fishing_clean %>%
+  # Reorder the CUs by their median rtwr_4 so the highest (likely Fin Fish) is at the top
+  ggplot(aes(x = fct_reorder(CU, rtwr_4, .fun = median, .na_rm = TRUE), y = rtwr_4)) +
+  geom_boxplot(fill = "skyblue", alpha = 0.6, outlier.shape = NA) +
+  coord_flip() + # Flipped because CU names are long
+  labs(
+    title = "Fishing Sector: Early Return-to-Work Ratio by CU",
+    subtitle = "Proving structural variance: Does the baseline CU inherently recover faster?",
+    x = NULL,
+    y = "Early Return-to-Work Ratio (rtwr_4)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.title.position = "plot",
+    axis.text.y = element_text(face = "bold", size = 10),
+    panel.grid.major.y = element_blank() # Cleans up the background
+  )
+```
+ 
+Pick Significant Cost Drivers: <br> 
+IY: time_loss_claims <br> 
+OY: avg_days_lost <br> 
+ <br> 
+Mixed Model with selected drivers: 
+
+```{r fish_final}
+variance_fishing_iy <- glmer(
+  # Scale to get coef > 0.1 for convergence
+  claim_cost_iy ~ I(time_loss_claims/10) + 
+    (1 | CU) + offset(logpay_iy_trend), 
+  family = Gamma(link = "log"), 
+  data = fishing_clean,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+variance_fishing_oy <- glmer(
+  # Scale to get coef > 0.1 for convergence
+  claim_cost_oy ~ I(avg_days_lost/100) + 
+    (1 | CU) + offset(logpay_oy_trend), 
+  family = Gamma(link = "log"), 
+  data = fishing_clean %>% filter( Year_index > 0),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e+05))
+)
+
+library(gtsummary)
+library(broom)
+
+tbl_iy <- tbl_regression(variance_fishing_iy, intercept = TRUE, exponentiate = TRUE, estimate_fun = ~style_sigfig(., digits = 3)) %>%
+  bold_p()
+tbl_oy <- tbl_regression(variance_fishing_oy, intercept = TRUE, exponentiate = TRUE, estimate_fun = ~style_sigfig(., digits = 3)) %>%
+  bold_p()
+final_table <- tbl_merge(
+  tbls = list(tbl_iy, tbl_oy),
+  tab_spanner = c("**Injury Year (IY)**", "**Prior Year (OY)**")
+) %>%
+  modify_caption("**Fishing: GLMM Cost Drivers**")
+final_table
+```
+
+The intercept p-value is large, meaning the priori offset is doing its job.  <br> 
+Frequency trend is detected in injury year and Severity trend is detected in prior year.  <br> 
+ <br> 
+Injury Year:  <br> 
+Holding the structural risk of the boat constant, every additional time-loss claim acts as a 1.02x multiplier on day-one costs.
+ <br> 
+Prior Year:  <br> 
+Because avg_days_lost was scaled, one sd increase in the average claim duration acts as a 1.15x multiplier on driving up the long-tail runoff costs. <br> 
+ <br> 
+Now we move onto the remaining variances captured by the CUs.  <br> 
+ <br> 
+The CU deviance: 
+
+```{r fish_cu}
+renaf_fishing <- bind_rows(
+  as.data.frame(ranef(variance_fishing_iy)) %>%
+  mutate(Model = "1. Injury Year (Day-One)"),
+  as.data.frame(ranef(variance_fishing_oy)) %>%
+  mutate(Model = "2. Prior Year (Runoff Tail)")
+  ) %>% 
+  rename(CU = grp, Effect = condval) %>%
+  mutate(
+    CU = str_wrap(str_remove(CU, "^\\d+\\s*-\\s*"), width = 25),
+    Risk_Type = ifelse(Effect > 0, "Structural Penalty (Expensive)", "Structural Discount (Cheap)")
+  )
+
+iy_order <- renaf_fishing %>% 
+  filter(Model == "1. Injury Year (Day-One)") %>% 
+  arrange(Effect) %>% 
+  pull(CU)
+renaf_fishing <- renaf_fishing %>% 
+  mutate(CU = factor(CU, levels = iy_order))
+
+ggplot(renaf_fishing, aes(x = CU, y = Effect, fill = Risk_Type)) +
+  geom_col(color = "black", alpha = 0.85) +
+  coord_flip() +
+  facet_wrap(~ Model, scales = "free_x") +
+  scale_fill_manual(values = c("Structural Penalty (Expensive)" = "#D55E00", 
+                               "Structural Discount (Cheap)" = "#0072B2")) +
+  
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Fishing: Structural Risk by Department",
+    subtitle = "Isolating the inherent difference",
+    x = NULL,
+    y = "Log Impact on Claim Costs"
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    panel.grid.major.y = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+```
+
+CU-level Risk: <br> 
+Fin Fish Farming is structurally insulated from both Day-One and long-tail risks (Random Intercepts consistently around -1). Their controlled environments naturally suppress severe injuries and easily accommodate light-duty work. 
+Seine Fishing (IY: +0.79, OY: +0.62) and Trawl Fishing (IY: +0.36, OY: +0.53) are inherently dangerous. Their environments structurally dangerous and act as mathematical multipliers for catastrophic, long-tail claim deteriorations. They require entirely different premium pricing structures. 
+
+\pagebreak
+
+### 2. 7220 - Heavy Construction
+
+```{r hvyconst_select}
+# Step-wise Trend Matching
+hvyconst_data <- wsbc_data_culvl %>%   filter(Subsector == "7220 - Heavy Construction") %>%
+  arrange(CU, Year) %>%
+  group_by(CU) %>%
+  mutate(
+    Payroll_Lag1 = lag(payroll, n = 1, default = NA)
+  ) %>%
+  ungroup()
+
+hvyconst_clean <- hvyconst_data %>%
+  select(
+    CU, claim_cost_iy, claim_cost_oy, Year_index, payroll, Payroll_Lag1, person_years, 
+    time_loss_claims, first_paid_ltd_claims, serious_injury_claims, 
+    six_month_truncated_duration, total_work_days_lost, 
+    rtw_lt4, rtw_lt26, rtw_gt26, sprains_and_strains_claims, long_recovery_sprains_and_strains_claims, 
+    `std/ltd/fatal_claims`, young_worker_claims, mature_worker_claims, 
+    first_paid_msi_claims, `msi_claims_(by_injury_year)`, 
+    first_paid_mvi_claims, `mvi_claims_(by_injury_year)`, 
+    aov_claims, overexertion_claims, fall_on_same_level_claims, 
+    average_completed_duration, total_work_days_lost, employer_cus, 
+    inspection_reports, other_contacts, orders, net_penalties_imposed, warning_letters_sent
+  )
+
+# There are only 2 negative claim_cost_oy, one from Pile Driving was quite significant
+# The spreading in negative losses work as follows: 
+hvyconst_clean <- hvyconst_clean %>%
+  arrange(CU, Year_index) %>% 
+  group_by(CU) %>%
+  mutate(
+    is_neg = claim_cost_oy < 0,
+    next_neg = lead(claim_cost_oy < 0, default = FALSE),
+    prev_neg = lag(claim_cost_oy < 0, default = FALSE),
+    claim_cost_oy_smth = case_when(
+      # Weighted spread
+      prev_neg ~ claim_cost_oy + 
+        (lag(claim_cost_oy) * (claim_cost_oy / (claim_cost_oy + lag(claim_cost_oy, n = 2, default = 0)))),
+      next_neg ~ claim_cost_oy + 
+        (lead(claim_cost_oy) * (claim_cost_oy / (claim_cost_oy + lead(claim_cost_oy, n = 2, default = 0)))),
+      is_neg ~ 0,
+      # If all FALSE
+      TRUE ~ claim_cost_oy
+    )
+  ) %>%
+  ungroup()
+
+# Feature Engineering
+hvyconst_iy_trd <- coef(glmm_iy_sub)$Subsector["7220 - Heavy Construction", "Year_index"]
+hvyconst_oy_trd <- coef(glmm_oy_sub)$Subsector["7220 - Heavy Construction", "Year_index"]
+hvyconst_iy_int <- coef(glmm_iy_sub)$Subsector["7220 - Heavy Construction", "(Intercept)"]
+hvyconst_oy_int <- coef(glmm_oy_sub)$Subsector["7220 - Heavy Construction", "(Intercept)"]
+
+hvyconst_clean <- hvyconst_clean %>%
+  mutate(
+    logpay_iy_trend = log(payroll) + hvyconst_iy_int + hvyconst_iy_trd * Year_index,
+    logpay_oy_trend = log(Payroll_Lag1) + hvyconst_oy_int + hvyconst_oy_trd * Year_index,
+    avg_wage = payroll / person_years,
+    avg_days_lost = total_work_days_lost / (time_loss_claims+ 1),
+    srs_rate = serious_injury_claims / (time_loss_claims+ 1),
+    rtwr_4 = rtw_lt4 / (rtw_lt26 + rtw_gt26+ 1),
+    rtwr_26 = rtw_gt26 / (rtw_lt26 + rtw_gt26+ 1),
+    lrss_rate = long_recovery_sprains_and_strains_claims / (sprains_and_strains_claims+ 1),
+    violate = orders / (inspection_reports+ 1),
+    Post_2020 = ifelse(Year_index >= 5, 1, 0)
+  )
+
+# step() cannot handle tweedie, response var needs to be positive
+# Current Year
+fit_iy_full <- glm(
+  pmax(1, claim_cost_iy) ~ offset(logpay_iy_trend) + time_loss_claims + (I(avg_wage/10000)*Post_2020) + 
+    rtwr_4 + avg_days_lost + violate,
+  data = hvyconst_clean,
+  family = Gamma(link = "log")
+)
+fit_iy_final <- step(fit_iy_full, direction = "backward", trace = 0) 
+
+# Prior Year
+fit_oy_full <- glm(
+  pmax(1, claim_cost_oy_smth) ~ offset(logpay_oy_trend) + time_loss_claims + (I(avg_wage/10000)*Post_2020) + 
+    rtwr_26 + lrss_rate + avg_days_lost + violate,
+  data = hvyconst_clean %>% filter( Year_index > 0),
+  family = Gamma(link = "log")
+)
+fit_oy_final <- step(fit_oy_full, direction = "backward", trace = 0)
+
+stargazer(fit_iy_final, fit_oy_final,
+          type = "text", 
+          title = "Heavy Construction: Stepwise GLM Selection",
+          column.labels = c("Injury Year (IY)", "Prior Year (OY)"),
+          dep.var.labels = c("Claim Costs"),
+          omit.stat = c("LL", "bic"),
+          single.row = TRUE)
+```
+
+```{r}
+fit_iy_full <- glm(
+  pmax(1, claim_cost_iy) ~ offset(logpay_iy_trend) + time_loss_claims + (I(avg_wage/10000)*Post_2020) + 
+    rtwr_4 + avg_days_lost + violate + CU,
+  data = hvyconst_clean,
+  family = Gamma(link = "log")
+)
+fit_iy_final <- step(fit_iy_full, direction = "backward", trace = 0) 
+
+# Prior Year
+fit_oy_full <- glm(
+  pmax(1, claim_cost_oy_smth) ~ offset(logpay_oy_trend) + time_loss_claims + (I(avg_wage/10000)*Post_2020) + 
+    rtwr_26 + lrss_rate + avg_days_lost + violate + CU,
+  data = hvyconst_clean %>% filter( Year_index > 0),
+  family = Gamma(link = "log")
+)
+fit_oy_final <- step(fit_oy_full, direction = "backward", trace = 0)
+
+stargazer(fit_iy_final, fit_oy_final,
+          type = "text", 
+          title = "Heavy Construction: Stepwise GLM Selection",
+          column.labels = c("Injury Year (IY)", "Prior Year (OY)"),
+          dep.var.labels = c("Claim Costs"),
+          omit.stat = c("LL", "bic"),
+          single.row = TRUE)
+```
+
+Note: Warning comes from missing 2015 - 2020 data from 722099 - Heavy Construction Combined CUs, which can be safely ignored since the later GLMM will partially pool it to the average. <br> 
+
+Baseline: CU722001 - Bridge, Overpass, or Viaduct Construction or Repair <br> 
+
+Anova Test
+
+```{r hvyconst_anova}
+library(glmmTMB)
+
+variance_hvyconst_iy_with_rtw <- glmmTMB(
+  claim_cost_iy ~ time_loss_claims + rtwr_4 + (I(avg_wage/10000)*Post_2020) + 
+    (1 | CU) + offset(logpay_iy_trend), 
+  data = hvyconst_clean, 
+  family = glmmTMB::tweedie(link = "log"), 
+  control = glmmTMBControl(optCtrl = list(iter.max = 1e+3, eval.max = 1e+3))
+)
+
+variance_hvyconst_iy_without_rtw <- glmmTMB(
+  claim_cost_iy ~ time_loss_claims + (I(avg_wage/10000)*Post_2020) + 
+    (1 | CU) + offset(logpay_iy_trend), 
+  data = hvyconst_clean, 
+  family = glmmTMB::tweedie(link = "log"), 
+  control = glmmTMBControl(optCtrl = list(iter.max = 1e+3, eval.max = 1e+3))
+)
+
+variance_hvyconst_iy_without_boom <- glmmTMB(
+  claim_cost_iy ~ time_loss_claims + 
+    (1 | CU) + offset(logpay_iy_trend), 
+  data = hvyconst_clean, 
+  family = glmmTMB::tweedie(link = "log"), 
+  control = glmmTMBControl(optCtrl = list(iter.max = 1e+3, eval.max = 1e+3))
+)
+
+anova(variance_hvyconst_iy_with_rtw, variance_hvyconst_iy_without_rtw, variance_hvyconst_iy_without_boom)
+anova(variance_hvyconst_iy_with_rtw, variance_hvyconst_iy_without_boom)
+
+variance_hvyconst_oy_with_tlc <- glmmTMB(
+  claim_cost_oy_smth ~ time_loss_claims + 
+    (1 | CU) + offset(logpay_oy_trend), 
+  data = hvyconst_clean %>% filter( Year_index > 0),
+  family = glmmTMB::tweedie(link = "log"),
+  control = glmmTMBControl(optCtrl = list(iter.max = 1e+3, eval.max = 1e+3))
+)
+
+plogis(variance_hvyconst_oy_with_tlc$fit$par["psi"]) + 1
+
+variance_hvyconst_oy_without_tlc <- glmmTMB(
+  claim_cost_oy_smth ~ 
+    (1 | CU) + offset(logpay_oy_trend), 
+  data = hvyconst_clean %>% filter( Year_index > 0),
+  family = glmmTMB::tweedie(link = "log"),
+  control = glmmTMBControl(optCtrl = list(iter.max = 1e+3, eval.max = 1e+3))
+)
+
+plogis(variance_hvyconst_oy_without_tlc$fit$par["psi"]) + 1
+
+anova(variance_hvyconst_oy_with_tlc, variance_hvyconst_oy_without_tlc)
+```
+
+Drop drop drop
+
+```{r}
+variance_hvyconst_iy <- variance_hvyconst_iy_without_rtw
+variance_hvyconst_oy <- variance_hvyconst_oy_without_tlc
+
+tbl_iy <- suppressMessages(tbl_regression(variance_hvyconst_iy, intercept = TRUE, exponentiate = TRUE, estimate_fun = ~style_sigfig(., digits = 3)) %>% bold_p())
+tbl_oy <- suppressMessages(tbl_regression(variance_hvyconst_oy, intercept = TRUE, exponentiate = TRUE, estimate_fun = ~style_sigfig(., digits = 3)) %>% bold_p())
+final_table <- tbl_merge(
+  tbls = list(tbl_iy, tbl_oy),
+  tab_spanner = c("**Injury Year (IY)**", "**Prior Year (OY)**"),
+  quiet = TRUE
+) %>%
+  modify_caption("**Heavy Construction: GLMM Cost Drivers**")
+
+final_table
+```
+
+```{r hvyconst_cu}
+renaf_hvyconst <- bind_rows(
+  as.data.frame(ranef(variance_hvyconst_iy)) %>%
+  mutate(Model = "1. Injury Year (Day-One)"),
+  as.data.frame(ranef(variance_hvyconst_oy)) %>%
+  mutate(Model = "2. Prior Year (Runoff Tail)")
+  ) %>% 
+  rename(CU = grp, Effect = condval) %>%
+  mutate(
+    CU = paste(substring(str_remove(CU, "^\\d+\\s*-\\s*"), 1, 24),"..."),
+    Risk_Type = ifelse(Effect > 0, "Structural Penalty (Expensive)", "Structural Discount (Cheap)")
+  )
+
+iy_order <- renaf_hvyconst %>% 
+  filter(Model == "1. Injury Year (Day-One)") %>% 
+  arrange(Effect) %>% 
+  pull(CU)
+renaf_hvyconst <- renaf_hvyconst %>% 
+  mutate(CU = factor(CU, levels = iy_order))
+
+ggplot(renaf_hvyconst, aes(x = CU, y = Effect, fill = Risk_Type)) +
+  geom_col(color = "black", alpha = 0.85) +
+  coord_flip() +
+  facet_wrap(~ Model, scales = "free_x") +
+  scale_fill_manual(values = c("Structural Penalty (Expensive)" = "#D55E00", 
+                               "Structural Discount (Cheap)" = "#0072B2")) +
+  
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Heavy Construction: Structural Risk by Department",
+    subtitle = "Isolating the inherent difference",
+    x = NULL,
+    y = "Log Impact on Claim Costs"
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    panel.grid.major.y = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+```
+
+Heavy Construction Subsector Drivers: <br> 
+
+IY:  <br> 
+First-year costs are heavily dictated by raw injury frequency (time_loss_claims acts as a highly significant 1.04x multiplier). <br> 
+OY:  <br> 
+In the long-term liability, frequency metrics lose their predictive power, the cost is entirely hard-coded into the physical nature of the specific industry. <br> 
+
+```{r hvycont_exp}
+hvyconst_data %>%
+  pivot_longer(cols = c(payroll, person_years), 
+               names_to = "Metric", 
+               values_to = "Value") %>%
+  ggplot(aes(x = Year, y = Value, fill = Metric)) +
+  geom_col(position = "identity", alpha = 0.8) + 
+  facet_grid(Metric ~ CU, scales = "free_y") +
+  scale_fill_manual(values = c("Payroll" = "#2c3e50", "Person_Years" = "#e67e22")) +
+  labs(title = "Heavy Construction: Volume of Payroll and Workforce by CU",
+       y = "Raw Value",
+       x = "Year") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text.y = element_text(angle = 0),
+        strip.text = element_text(hjust = 0, face = "bold"))
+
+hvyconst_data %>%
+  # The Pure Premium Dilution
+  mutate(
+    Average_Wage = payroll / person_years,
+    CU_Short = paste0(str_extract(CU, "^\\d+"), " - ", str_trunc(str_remove(CU, "^\\d+\\s*-\\s*"), 25))
+  ) %>%
+  ggplot(aes(x = Year, y = Average_Wage, color = CU_Short)) +
+  geom_line(linewidth = 1, alpha = 0.6) +
+  geom_point(aes(size = payroll), alpha = 0.3) + 
+  scale_size_continuous(
+    name = "Payroll Volume",
+    labels = label_dollar(scale = 1e-6, suffix = "M"),
+    range = c(1, 16)
+  ) +
+  scale_y_continuous(labels = label_dollar()) +
+  scale_x_continuous(breaks = min(hvyconst_data$Year):max(hvyconst_data$Year)) +
+  labs(
+    title = "Heavy Construction: The Pure Premium Dilution Effect",
+    subtitle = "Tracking Average Wage inflation. Bubble size represents the payroll weights.",
+    x = "Year",
+    y = "Average Wage per Person Years",
+    color = "Classification Unit"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    plot.title.position = "plot",
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+```
+
+Highlight that heavy infrastructure CUs saw explosive growth post-2020 due to provincial mega-projects. 
+Recall we have engineered the average wage metric (avg_wage) to test if high-exposure mega-projects carried inherently different risk rates. However, the stepwise algorithm rejected it. This mathematically proves two things: 
+First, our 10-year baseline and CU variables successfully absorbed the structural differences from the mega-projects. 
+Second, besides the RTW < 4 weeks effect on the first year cost, the risk is mostly tied to the machinery and the trade. 
+
+\pagebreak
+
+### 3. 7530 - Public Administration
+
+```{r pbadmin_feat}
+# Step-wise Trend Matching
+pbadmin_data <- wsbc_data_culvl %>% 
+  filter(Subsector == "7530 - Public Administration") %>%
+  arrange(CU, Year) %>%
+  group_by(CU) %>%
+  mutate(
+    Payroll_Lag1 = lag(payroll, n = 1, default = NA)
+  ) %>%
+  ungroup()
+
+pbadmin_clean <- pbadmin_data %>%
+  select(
+    CU, claim_cost_iy, claim_cost_oy, Year_index, payroll, Payroll_Lag1, person_years, 
+    time_loss_claims, first_paid_ltd_claims, serious_injury_claims, 
+    six_month_truncated_duration, total_work_days_lost, 
+    rtw_lt4, rtw_lt26, rtw_gt26, sprains_and_strains_claims, long_recovery_sprains_and_strains_claims, 
+    `std/ltd/fatal_claims`, young_worker_claims, mature_worker_claims, 
+    first_paid_msi_claims, `msi_claims_(by_injury_year)`, 
+    first_paid_mvi_claims, `mvi_claims_(by_injury_year)`, 
+    aov_claims, overexertion_claims, fall_on_same_level_claims, 
+    average_completed_duration, total_work_days_lost, employer_cus, 
+    inspection_reports, other_contacts, orders, net_penalties_imposed, warning_letters_sent
+  )
+
+# Feature Engineering
+pbadmin_iy_trd <- coef(glmm_iy_sub)$Subsector["7530 - Public Administration", "Year_index"]
+pbadmin_oy_trd <- coef(glmm_oy_sub)$Subsector["7530 - Public Administration", "Year_index"]
+pbadmin_iy_int <- coef(glmm_iy_sub)$Subsector["7530 - Public Administration", "(Intercept)"]
+pbadmin_oy_int <- coef(glmm_oy_sub)$Subsector["7530 - Public Administration", "(Intercept)"]
+
+pbadmin_clean <- pbadmin_clean %>%
+  mutate(
+    logpay_iy_trend = log(payroll) + pbadmin_iy_int + pbadmin_iy_trd * Year_index,
+    logpay_oy_trend = log(Payroll_Lag1) + pbadmin_oy_int + pbadmin_oy_trd * Year_index,
+    log_avg_wage = log(payroll / person_years),
+    avg_days_lost = total_work_days_lost / (time_loss_claims+ 1),
+    aov_rate = aov_claims / (time_loss_claims + 1), # Specifically for the cops
+    srs_rate = serious_injury_claims / (time_loss_claims+ 1),
+    rtwr_4 = rtw_lt4 / (rtw_lt26 + rtw_gt26+ 1),
+    rtwr_26 = rtw_gt26 / (rtw_lt26 + rtw_gt26+ 1),
+    lrss_rate = long_recovery_sprains_and_strains_claims / (sprains_and_strains_claims+ 1),
+    violate = orders / (inspection_reports+ 1)
+  )
+```
+
+```{r pbadmin_select1}
+# Without CU
+# Current Year
+fit_iy_full <- glm(
+  claim_cost_iy ~ offset(logpay_iy_trend) + time_loss_claims + log_avg_wage +
+    avg_days_lost + rtwr_4 + aov_rate + violate,
+  data = pbadmin_clean,
+  family = Gamma(link = "log")
+)
+fit_iy_final <- step(fit_iy_full, direction = "backward", trace = 0) 
+
+# Prior Year
+fit_oy_full <- glm(
+  claim_cost_oy ~ offset(logpay_oy_trend) + time_loss_claims + log_avg_wage + 
+    avg_days_lost + rtwr_26 + aov_rate + lrss_rate + violate,
+  data = pbadmin_clean %>% filter(Year_index > 0),
+  family = Gamma(link = "log")
+)
+fit_oy_final <- step(fit_oy_full, direction = "backward", trace = 0)
+
+stargazer(fit_iy_final, fit_oy_final,
+          type = "text", 
+          title = "Public Admin: Stepwise GLM Selection",
+          column.labels = c("Injury Year (IY)", "Prior Year (OY)"),
+          dep.var.labels = c("Claim Costs"),
+          omit.stat = c("LL", "bic"),
+          single.row = TRUE)
+```
+
+```{r pbadmin_select2}
+# With CU
+# Current Year
+fit_iy_full <- glm(
+  claim_cost_iy ~ offset(logpay_iy_trend) + time_loss_claims + log_avg_wage +
+    avg_days_lost + rtwr_4 + aov_rate + violate + CU,
+  data = pbadmin_clean,
+  family = Gamma(link = "log")
+)
+fit_iy_final <- step(fit_iy_full, direction = "backward", trace = 0) 
+
+# Prior Year
+fit_oy_full <- glm(
+  claim_cost_oy ~ offset(logpay_oy_trend) + time_loss_claims + log_avg_wage + 
+    avg_days_lost + rtwr_26 + aov_rate + lrss_rate + violate + CU,
+  data = pbadmin_clean %>% filter(Year_index > 0),
+  family = Gamma(link = "log")
+)
+fit_oy_final <- step(fit_oy_full, direction = "backward", trace = 0)
+
+stargazer(fit_iy_final, fit_oy_final,
+          type = "text", 
+          title = "Public Admin: Stepwise GLM Selection",
+          column.labels = c("Injury Year (IY)", "Prior Year (OY)"),
+          dep.var.labels = c("Claim Costs"),
+          omit.stat = c("LL", "bic"),
+          single.row = TRUE)
+```
+
+Baseline: CU753002 - First Nations Operations <br> 
+ <br> 
+After introduced the CUs, the signal from the injury frequency (time_loss_claims) has weaken, mostly driven by Law Enforcement. The OY model may have better explanatory power from the injury severity drivers (avg_days_lost and lrss_rate). Our proud aov_rate factor does not work after all, the Law Enforcement stole its significance. 
+ <br> 
+Pick Significant Cost Drivers: <br> 
+IY: time_loss_claims, time_loss_claims <br> 
+OY: time_loss_claims, avg_days_lost, lrss_rate <br> 
+ <br> 
+Mixed Model with selected drivers:  <br> 
+We first fine-tune the model by deciding whether time_loss_claims needs to be dropped: 
+```{r pbadmin_anova}
+variance_pbadmin_iy_with_tlc <- glmer(
+  claim_cost_iy ~ I(time_loss_claims/100) + 
+    (1 | CU) + offset(logpay_iy_trend), 
+  family = Gamma(link = "log"), 
+  data = pbadmin_clean
+)
+variance_pbadmin_iy_without_tlc <- glmer(
+  claim_cost_iy ~ 
+    (1 | CU) + offset(logpay_iy_trend), 
+  family = Gamma(link = "log"), 
+  data = pbadmin_clean
+)
+variance_pbadmin_oy_with_tlclrss <- glmer(
+  claim_cost_oy ~ I(time_loss_claims/100) + I(avg_days_lost/10) + lrss_rate + 
+    (1 | CU) + offset(logpay_oy_trend), 
+  family = Gamma(link = "log"), 
+  data = pbadmin_clean %>% filter( Year_index > 0)
+)
+variance_pbadmin_oy_without_tlc <- glmer(
+  claim_cost_oy ~ I(avg_days_lost/10) + lrss_rate + 
+    (1 | CU) + offset(logpay_oy_trend), 
+  family = Gamma(link = "log"), 
+  data = pbadmin_clean %>% filter( Year_index > 0)
+)
+variance_pbadmin_oy_without_lrss <- glmer(
+  claim_cost_oy ~ I(time_loss_claims/100) + I(avg_days_lost/10) +
+    (1 | CU) + offset(logpay_oy_trend), 
+  family = Gamma(link = "log"), 
+  data = pbadmin_clean %>% filter( Year_index > 0)
+)
+variance_pbadmin_oy_without_tlclrss <- glmer(
+  claim_cost_oy ~ I(avg_days_lost/10) + 
+    (1 | CU) + offset(logpay_oy_trend), 
+  family = Gamma(link = "log"), 
+  data = pbadmin_clean %>% filter( Year_index > 0)
+)
+
+anova(variance_pbadmin_iy_with_tlc, variance_pbadmin_iy_without_tlc)
+anova(variance_pbadmin_oy_with_tlclrss,variance_pbadmin_oy_without_tlc,
+      variance_pbadmin_oy_without_lrss,variance_pbadmin_oy_without_tlclrss)
+anova(variance_pbadmin_oy_with_tlclrss,variance_pbadmin_oy_without_tlclrss)
+```
+
+The time_loss_claims beats the reduced IY model but lost in the OY model. 
+ <br> 
+Pick Significant Cost Drivers (Final): <br> 
+IY: time_loss_claims <br> 
+OY: avg_days_lost, lrss_rate <br> 
+
+```{r pbadmin_final}
+# Select the winner: 
+variance_pbadmin_iy <- variance_pbadmin_iy_with_tlc 
+variance_pbadmin_oy <- variance_pbadmin_oy_without_tlclrss
+
+tbl_iy <- tbl_regression(variance_pbadmin_iy, intercept = TRUE, exponentiate = TRUE, estimate_fun = ~style_sigfig(., digits = 3)) %>% bold_p()
+tbl_oy <- tbl_regression(variance_pbadmin_oy, intercept = TRUE, exponentiate = TRUE, estimate_fun = ~style_sigfig(., digits = 3)) %>% bold_p()
+final_table <- tbl_merge(
+  tbls = list(tbl_iy, tbl_oy),
+  tab_spanner = c("**Injury Year (IY)**", "**Prior Year (OY)**")
+) %>%
+  modify_caption("**Public Admin: GLMM Cost Drivers**")
+final_table
+```
+
+
+The CU deviance: 
+
+```{r pbadmin_cu}
+renaf_pbadmin <- bind_rows(
+  as.data.frame(ranef(variance_pbadmin_iy)) %>%
+  mutate(Model = "1. Injury Year (Day-One)"),
+  as.data.frame(ranef(variance_pbadmin_oy)) %>%
+  mutate(Model = "2. Prior Year (Runoff Tail)")
+  ) %>% 
+  rename(CU = grp, Effect = condval) %>%
+  mutate(
+    CU = str_wrap(str_remove(CU, "^\\d+\\s*-\\s*"), width = 25),
+    Risk_Type = ifelse(Effect > 0, "Structural Penalty (Expensive)", "Structural Discount (Cheap)")
+  )
+
+iy_order <- renaf_pbadmin %>% 
+  filter(Model == "1. Injury Year (Day-One)") %>% 
+  arrange(Effect) %>% 
+  pull(CU)
+renaf_pbadmin <- renaf_pbadmin %>% 
+  mutate(CU = factor(CU, levels = iy_order))
+
+ggplot(renaf_pbadmin, aes(x = CU, y = Effect, fill = Risk_Type)) +
+  geom_col(color = "black", alpha = 0.85) +
+  coord_flip() +
+  facet_wrap(~ Model, scales = "free_x") +
+  scale_fill_manual(values = c("Structural Penalty (Expensive)" = "#D55E00", 
+                               "Structural Discount (Cheap)" = "#0072B2")) +
+  
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Public Admin: Structural Risk by Department",
+    subtitle = "Isolating the inherent difference",
+    x = NULL,
+    y = "Log Impact on Claim Costs"
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    panel.grid.major.y = element_blank(),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+```
+
+As proven by the Likelihood Ratio Test (ANOVA with p = 0.04961, 95% reject = 0), the overall claim frequency (time_loss_claims) becomes a significant driver of immediate costs across the entire sector (+1.34(scaled), p < 0.047). Regardless of whether the injury happens in a local government office or on police patrol, more injuries universally mean higher immediate medical and wage-loss expenses. <br> 
+
+In the runoff tail, the claim frequency loses predictive power (ANOVA with p = 0.137, not able to reject = 0), meaning the claim frequency has no bearing on long-tail liability. Instead, severity—measured by the average claim duration (scale(avg_days_lost)) becomes the universal trigger, driving a 1.10x penalty multiplier on runoff costs. <br> 
+
+Law Enforcement carries a massive structural penalty across both Injury Year and Prior Year models. When introducing the "Acts of Violence" (aov_rate) feature, the stepwise algorithm initially showed massive significance. However, once the CU variables were introduced, Law Enforcement completely absorbed the aov_rate's significance. The algorithm cannot mathematically separate the concept of "Law Enforcement" from "extreme rates of violence. (multicollinearity)
+
+
